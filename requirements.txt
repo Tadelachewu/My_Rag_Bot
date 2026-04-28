@@ -6,3 +6,7 @@ requests>=2.28.0
 python-pptx>=0.6.21
 python-docx>=0.8.11
 httpx==0.24.1
+sentence-transformers==2.3.0
+openai>=0.27.0
+transformers>=4.30.0
+torch>=2.0.0

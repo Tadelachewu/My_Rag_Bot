@@ -1,17 +1,33 @@
 import os
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, Document, BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, Document, BotCommand
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 import chromadb
 # Use the helper constructors exported by chromadb (PersistentClient/EphemeralClient)
 import requests
 from typing import Optional
-import openai
 import json
 import re
 load_dotenv()
+if os.path.exists(",env"):
+    load_dotenv(dotenv_path=",env", override=False)
+
+def clean_for_telegram(text: str) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    s = s.replace("\r\n", "\n")
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", s)
+    s = re.sub(r"`{1,3}([^`]+)`{1,3}", r"\1", s)
+    s = re.sub(r"^\s*#+\s*", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^\s*[-*]\s+", "- ", s, flags=re.MULTILINE)
+    s = re.sub(r"^\s*\d+\.\s+", lambda m: m.group(0).lstrip(), s, flags=re.MULTILINE)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
 
 # Basic logging setup must be available before other initialization
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -29,6 +45,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 embed_model = None
 
 import sqlite3
+import time
 
 # Environment
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -53,64 +70,83 @@ def run_openrouter_embeddings(texts, model: Optional[str] = None):
         return None
     url = "https://openrouter.ai/api/v1/embeddings"
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-# Build and send request to OpenRouter embeddings endpoint
-    payload = {"model": model or "text-embedding-3-small", "input": texts}
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60.0)
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenRouter embeddings error {resp.status_code}: {resp.text}")
-    data = resp.json()
-    # Expecting data['data'] -> list of {'embedding': [...]} 
-    return [item.get("embedding") for item in data.get("data", [])]
-# ChromaDB persistent client / collection setup
-CHROMA_PERSIST_DIR = os.getenv('CHROMA_PERSIST_DIR', 'chroma_db')
-persist_dir = _Path(CHROMA_PERSIST_DIR)
-persist_dir.mkdir(parents=True, exist_ok=True)
-
-collection_name = os.getenv('CHROMA_COLLECTION_NAME', 'documents')
-try:
-    PersistentClient = getattr(chromadb, "PersistentClient", None)
-    if PersistentClient is not None:
-        client = PersistentClient(path=str(persist_dir))
-    else:
-        # fallback to generic client (may be ephemeral)
-        client = chromadb.Client()
+    timeout = float(os.getenv("OPENROUTER_HTTP_TIMEOUT", "120"))
+    model_name = model or os.getenv("OPENROUTER_EMBED_MODEL", "text-embedding-3-small")
     try:
-        collection = client.get_collection(name=collection_name)
+        batch_size = int(os.getenv("OPENROUTER_EMBED_BATCH_SIZE", "64"))
     except Exception:
-        collection = client.create_collection(name=collection_name)
-except Exception as exc:
-    msg = str(exc) or ""
-    # Handle older Chroma sqlite schema mismatch (common when upgrading versions)
-    if isinstance(exc, sqlite3.OperationalError) or "no such column: collections.topic" in msg:
-        dbfile = persist_dir / "chroma.sqlite3"
-        if dbfile.exists():
-            bak = persist_dir / "chroma.sqlite3.bak"
-            try:
-                os.replace(dbfile, bak)
-                logger.warning("Backed up old ChromaDB sqlite to %s due to schema error", str(bak))
-            except Exception:
-                logger.exception("Failed to back up ChromaDB sqlite file")
-        # retry creating a fresh persistent client and collection
+        batch_size = 64
+    if batch_size <= 0:
+        batch_size = 64
+
+    out = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        payload = {"model": model_name, "input": batch}
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"OpenRouter embeddings error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        out.extend([item.get("embedding") for item in data.get("data", [])])
+    if len(out) != len(texts):
+        raise RuntimeError(f"OpenRouter embeddings returned {len(out)} vectors for {len(texts)} inputs")
+    return out
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
+collection_name = os.getenv("CHROMA_COLLECTION_NAME", "documents")
+PersistentClient = getattr(chromadb, "PersistentClient", None)
+
+def init_chroma():
+    base_dir = _Path(CHROMA_PERSIST_DIR)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    def make_client(path: _Path):
+        if PersistentClient is not None:
+            return PersistentClient(path=str(path))
+        return chromadb.Client()
+
+    def get_or_create(c):
         try:
-            if PersistentClient is not None:
-                client = PersistentClient(path=str(persist_dir))
-            else:
-                client = chromadb.Client()
-            collection = client.create_collection(name=collection_name)
+            return c.get_collection(name=collection_name)
         except Exception:
-            logger.exception("Failed to recreate ChromaDB client after backing up sqlite")
-            client = chromadb.Client()
+            return c.create_collection(name=collection_name)
+
+    try:
+        c = make_client(base_dir)
+        return c, get_or_create(c), base_dir
+    except Exception as exc:
+        msg = str(exc) or ""
+        is_schema_mismatch = isinstance(exc, sqlite3.OperationalError) and "collections.topic" in msg
+        if is_schema_mismatch:
+            dbfile = base_dir / "chroma.sqlite3"
+            if dbfile.exists():
+                bak = base_dir / f"chroma.sqlite3.bak.{int(time.time())}"
+                try:
+                    os.replace(dbfile, bak)
+                    logger.warning("Backed up old ChromaDB sqlite to %s due to schema mismatch", str(bak))
+                except PermissionError:
+                    logger.warning("ChromaDB sqlite is locked; leaving it in place and using a fresh DB")
+                except Exception:
+                    logger.warning("Failed to back up ChromaDB sqlite; using a fresh DB", exc_info=True)
+
+            suffix = 1
+            fresh_dir = _Path(f"{CHROMA_PERSIST_DIR}_fresh")
+            while fresh_dir.exists():
+                suffix += 1
+                fresh_dir = _Path(f"{CHROMA_PERSIST_DIR}_fresh_{suffix}")
+            fresh_dir.mkdir(parents=True, exist_ok=True)
             try:
-                collection = client.get_collection(name=collection_name)
+                c = make_client(fresh_dir)
+                return c, get_or_create(c), fresh_dir
             except Exception:
-                collection = client.create_collection(name=collection_name)
-    else:
-        logger.exception("Failed to initialize ChromaDB client; continuing without persistence")
-        client = chromadb.Client()
-        try:
-            collection = client.get_collection(name=collection_name)
-        except Exception:
-            collection = client.create_collection(name=collection_name)
+                logger.exception("Failed to create fresh ChromaDB; falling back to in-memory client")
+                c = chromadb.Client()
+                return c, get_or_create(c), base_dir
+
+        logger.exception("Failed to initialize ChromaDB client; falling back to in-memory client")
+        c = chromadb.Client()
+        return c, get_or_create(c), base_dir
+
+client, collection, persist_dir = init_chroma()
 
 def embed_texts(texts):
     """Return list of embeddings for `texts`.
@@ -120,30 +156,40 @@ def embed_texts(texts):
       2. OpenAI (if `OPENAI_API_KEY` set) -- kept as optional fallback
       3. Local `sentence-transformers` fallback (if installed)
     """
+    remote_error = None
     # 1) OpenRouter
     if OPENROUTER_API_KEY:
         try:
             embs = run_openrouter_embeddings(texts)
             if embs:
                 return embs
-        except Exception:
+        except Exception as exc:
+            remote_error = f"OpenRouter embeddings failed: {exc}"
             logger.exception("OpenRouter embeddings failed, falling back")
 
     # 2) OpenAI (optional fallback if user still has key)
     if OPENAI_API_KEY:
         try:
-            # lazy import of openai to avoid dependency when not used
             import openai as _openai
+            # Support both OpenAI SDK v1 and legacy SDK
+            if hasattr(_openai, "OpenAI"):
+                client = _openai.OpenAI(api_key=OPENAI_API_KEY)
+                resp = client.embeddings.create(model="text-embedding-3-small", input=texts)
+                return [d.embedding for d in getattr(resp, "data", [])]
             _openai.api_key = OPENAI_API_KEY
             resp = _openai.Embedding.create(model="text-embedding-3-small", input=texts)
             return [d["embedding"] for d in resp["data"]]
-        except Exception:
+        except Exception as exc:
+            if remote_error is None:
+                remote_error = f"OpenAI embeddings failed: {exc}"
             logger.exception("OpenAI embeddings failed, falling back")
 
     # 3) Local sentence-transformers fallback
     try:
         from sentence_transformers import SentenceTransformer
     except Exception:
+        if remote_error:
+            raise RuntimeError(remote_error)
         raise RuntimeError(
             "No remote embedding key available and `sentence-transformers` is not installed. "
             "Set OPENROUTER_API_KEY or OPENAI_API_KEY, or install sentence-transformers on a compatible Python version."
@@ -158,11 +204,9 @@ def embed_texts(texts):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("Upload PDF") , KeyboardButton("Ask Question")]], resize_keyboard=True, one_time_keyboard=False)
     await update.message.reply_text(
-        "Welcome — send PDF files (as Documents) to upload/update the knowledge base, then ask questions.\n\n"
-        "Use the buttons below or the paperclip icon to upload PDFs.",
-        reply_markup=keyboard,
+        "Welcome — send PDF/PPTX/DOCX files (as Documents) to upload/update the knowledge base, then ask questions.\n\n"
+        "Use the paperclip/attachment icon to upload documents.",
     )
 
 async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,10 +244,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # semantic chunking: prefer sentence-aware chunks with overlap
     chunks = chunk_text(text)
     logger.info("Extracted text length=%d; creating %d chunks", len(text), len(chunks))
-    embeddings = embed_texts(chunks)
+    try:
+        embeddings = embed_texts(chunks)
+    except Exception as exc:
+        logger.exception("Embedding failed: %s", exc)
+        await update.message.reply_text(
+            "Embedding failed. Configure OPENROUTER_API_KEY or OPENAI_API_KEY, or install sentence-transformers."
+        )
+        return
 
     ids = [f"{doc.file_name}--{i}" for i in range(len(chunks))]
     metadatas = [{"source": doc.file_name, "chunk": i} for i in range(len(chunks))]
+
+    try:
+        collection.delete(where={"source": doc.file_name})
+    except Exception:
+        pass
 
     collection.add(ids=ids, metadatas=metadatas, documents=chunks, embeddings=embeddings)
     # Persist if the client exposes a persist method (some client implementations do)
@@ -225,7 +281,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No documents uploaded yet.")
         return
 
-    q_emb = embed_texts([question])[0]
+    try:
+        q_emb = embed_texts([question])[0]
+    except Exception as exc:
+        logger.exception("Embedding failed: %s", exc)
+        await update.message.reply_text(
+            "Embedding failed. Configure OPENROUTER_API_KEY or OPENAI_API_KEY, or install sentence-transformers."
+        )
+        return
     # retrieve top 5
     results = collection.query(query_embeddings=[q_emb], n_results=5, include=['documents','metadatas','distances'])
     docs = results.get('documents', [[]])[0]
@@ -291,7 +354,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shown = sources[:max_show]
         more = len(sources) - len(shown)
         src_line = "Sources: " + (", ".join(shown) + (f" and {more} more" if more > 0 else "")) if shown else ""
-        reply = llm_out
+        reply = clean_for_telegram(llm_out)
         if src_line:
             reply = reply + "\n\n" + src_line
         await update.message.reply_text(reply)
@@ -311,7 +374,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shown = sources[:max_show]
     more = len(sources) - len(shown)
     src_line = "Sources: " + (", ".join(shown) + (f" and {more} more" if more > 0 else "")) if shown else ""
-    reply = answer
+    reply = clean_for_telegram(answer)
     if src_line:
         reply = reply + "\n\n" + src_line
     await update.message.reply_text(reply)
@@ -344,14 +407,33 @@ def generate_answer_from_passages(question: str, passages: list[str]) -> Optiona
     # Use OpenAI ChatCompletion if API key available
     if OPENAI_API_KEY:
         try:
-            chat_resp = openai.ChatCompletion.create(
-                model=os.getenv('OPENAI_CHAT_MODEL', 'gpt-3.5-turbo'),
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            import openai as _openai
+            model = os.getenv("OPENAI_CHAT_MODEL", "gpt-3.5-turbo")
+            if hasattr(_openai, "OpenAI"):
+                client = _openai.OpenAI(api_key=OPENAI_API_KEY)
+                chat_resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=512,
+                    temperature=0.0,
+                )
+                return (chat_resp.choices[0].message.content or "").strip()
+
+            _openai.api_key = OPENAI_API_KEY
+            chat_resp = _openai.ChatCompletion.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
                 max_tokens=512,
                 temperature=0.0,
             )
-            msg = chat_resp['choices'][0]['message']['content']
-            return msg
+            msg = chat_resp["choices"][0]["message"]["content"]
+            return (msg or "").strip()
         except Exception:
             logger.exception("OpenAI chat completion failed")
 
@@ -484,6 +566,9 @@ def main():
             logger.info("Registered bot commands: %s", [c.command for c in cmds])
         except Exception:
             logger.exception("Failed to register bot commands")
+
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is not set. Put it in your environment or a .env file.")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
 
