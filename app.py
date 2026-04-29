@@ -6,13 +6,14 @@ from typing import List
 
 from bot import (
     embed_texts,
-    collection,
+    get_collection,
     WORKDIR,
     chunk_text,
     generate_answer_from_passages,
     build_telegram_application,
     start_telegram_polling,
     stop_telegram_polling,
+    clear_all_data,
     logger as bot_logger,
 )
 from pdf_utils import extract_text_from_file
@@ -63,6 +64,7 @@ async def health():
 
 @app.post("/ask")
 async def ask(question: dict):
+    collection = get_collection()
     q = question.get("question") if isinstance(question, dict) else None
     if not q:
         raise HTTPException(status_code=400, detail="Missing 'question' in request body")
@@ -103,6 +105,7 @@ async def ask(question: dict):
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
+    collection = get_collection()
     fname = file.filename or "uploaded_file"
     suffix = os.path.splitext(fname)[1].lower()
     if suffix not in (".pdf", ".pptx", ".docx"):
@@ -148,3 +151,8 @@ async def upload(file: UploadFile = File(...)):
         pass
 
     return {"status": "ok", "indexed_chunks": len(chunks)}
+
+
+@app.post("/clear")
+async def clear():
+    return clear_all_data()

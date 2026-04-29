@@ -12,6 +12,7 @@ from typing import Optional
 import json
 import re
 from telegram.ext import Application
+from datetime import datetime
 load_dotenv()
 if os.path.exists(",env"):
     load_dotenv(dotenv_path=",env", override=False)
@@ -151,6 +152,79 @@ def init_chroma():
 
 client, collection, persist_dir = init_chroma()
 
+def get_collection():
+    return collection
+
+
+def _make_chroma_client(path: _Path):
+    if PersistentClient is not None:
+        return PersistentClient(path=str(path))
+    return chromadb.Client()
+
+
+def _get_or_create_collection(c):
+    try:
+        return c.get_collection(name=collection_name)
+    except Exception:
+        return c.create_collection(name=collection_name)
+
+
+def clear_all_data() -> dict:
+    global client, collection, persist_dir
+
+    deleted_files = 0
+    file_errors = 0
+    try:
+        WORKDIR.mkdir(parents=True, exist_ok=True)
+        for p in WORKDIR.iterdir():
+            try:
+                if p.is_file():
+                    p.unlink()
+                    deleted_files += 1
+            except Exception:
+                file_errors += 1
+    except Exception:
+        file_errors += 1
+
+    try:
+        try:
+            client.delete_collection(name=collection_name)
+        except Exception:
+            pass
+
+        base = _Path(CHROMA_PERSIST_DIR)
+        stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        suffix = 0
+        fresh_dir = _Path(f"{CHROMA_PERSIST_DIR}_fresh_clear_{stamp}")
+        while fresh_dir.exists():
+            suffix += 1
+            fresh_dir = _Path(f"{CHROMA_PERSIST_DIR}_fresh_clear_{stamp}_{suffix}")
+        fresh_dir.mkdir(parents=True, exist_ok=True)
+
+        client = _make_chroma_client(fresh_dir)
+        collection = _get_or_create_collection(client)
+        persist_dir = fresh_dir
+
+        persist_fn = getattr(client, "persist", None)
+        if callable(persist_fn):
+            persist_fn()
+
+        return {
+            "ok": True,
+            "deleted_files": deleted_files,
+            "file_errors": file_errors,
+            "chroma_dir": str(persist_dir),
+        }
+    except Exception as exc:
+        logger.exception("Clear failed: %s", exc)
+        return {
+            "ok": False,
+            "deleted_files": deleted_files,
+            "file_errors": file_errors,
+            "error": str(exc),
+        }
+
+
 def embed_texts(texts):
     """Return list of embeddings for `texts`.
 
@@ -219,7 +293,28 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send your question as a plain text message; I'll answer based only on uploaded PDFs.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Upload PDFs and then ask questions. Replies are only from your documents.")
+    await update.message.reply_text(
+        "Upload PDFs/PPTX/DOCX and then ask questions. Replies are only from your documents.\n\n"
+        "Commands:\n"
+        "/upload\n"
+        "/ask\n"
+        "/clear\n"
+        "/help"
+    )
+
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    res = clear_all_data()
+    if res.get("ok"):
+        await update.message.reply_text(
+            f"Cleared uploaded files and reset vector DB.\n"
+            f"Deleted files: {res.get('deleted_files', 0)}\n"
+            f"Vector DB: {res.get('chroma_dir')}"
+        )
+        return
+    await update.message.reply_text(
+        f"Clear failed.\nDeleted files: {res.get('deleted_files', 0)}\nError: {res.get('error')}"
+    )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc: Document = update.message.document
@@ -562,6 +657,7 @@ async def _post_init(application: Application):
             BotCommand("start", "Start"),
             BotCommand("upload", "Upload a PDF"),
             BotCommand("ask", "Ask a question"),
+            BotCommand("clear", "Clear all uploaded files and reset DB"),
             BotCommand("help", "Help"),
         ]
         await application.bot.set_my_commands(cmds)
@@ -579,6 +675,7 @@ def build_telegram_application(token: Optional[str] = None) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("upload", upload_cmd))
     application.add_handler(CommandHandler("ask", ask_cmd))
+    application.add_handler(CommandHandler("clear", clear_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
