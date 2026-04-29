@@ -11,6 +11,7 @@ import requests
 from typing import Optional
 import json
 import re
+from telegram.ext import Application
 load_dotenv()
 if os.path.exists(",env"):
     load_dotenv(dotenv_path=",env", override=False)
@@ -38,6 +39,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # reduce noisy libraries
 logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("chromadb").setLevel(logging.INFO)
 
 # Embedding/OpenAI defaults used by embed_texts
@@ -553,31 +556,54 @@ def choose_llm(prompt: str) -> Optional[str]:
             return out
     return run_ollama(prompt)
 
-def main():
-    async def on_startup(app):
-        try:
-            cmds = [
-                BotCommand("start", "Start"),
-                BotCommand("upload", "Upload a PDF"),
-                BotCommand("ask", "Ask a question"),
-                BotCommand("help", "Help"),
-            ]
-            await app.bot.set_my_commands(cmds)
-            logger.info("Registered bot commands: %s", [c.command for c in cmds])
-        except Exception:
-            logger.exception("Failed to register bot commands")
+async def _post_init(application: Application):
+    try:
+        cmds = [
+            BotCommand("start", "Start"),
+            BotCommand("upload", "Upload a PDF"),
+            BotCommand("ask", "Ask a question"),
+            BotCommand("help", "Help"),
+        ]
+        await application.bot.set_my_commands(cmds)
+        logger.info("Registered bot commands: %s", [c.command for c in cmds])
+    except Exception:
+        logger.exception("Failed to register bot commands")
 
-    if not TELEGRAM_TOKEN:
+
+def build_telegram_application(token: Optional[str] = None) -> Application:
+    token = (token or TELEGRAM_TOKEN or "").strip()
+    if not token:
         raise RuntimeError("TELEGRAM_TOKEN is not set. Put it in your environment or a .env file.")
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
+    application = ApplicationBuilder().token(token).post_init(_post_init).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("upload", upload_cmd))
+    application.add_handler(CommandHandler("ask", ask_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return application
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("upload", upload_cmd))
-    app.add_handler(CommandHandler("ask", ask_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+async def start_telegram_polling(application: Application) -> None:
+    await application.initialize()
+    await application.start()
+    if application.updater is None:
+        raise RuntimeError("Telegram polling requires an updater, but it is not available on this Application.")
+    await application.updater.start_polling(drop_pending_updates=True)
+
+
+async def stop_telegram_polling(application: Application) -> None:
+    try:
+        if application.updater is not None:
+            await application.updater.stop()
+    finally:
+        await application.stop()
+        await application.shutdown()
+
+
+def main():
+    app = build_telegram_application()
 
     # Startup info
     masked = (TELEGRAM_TOKEN[:6] + "...") if TELEGRAM_TOKEN else "(none)"

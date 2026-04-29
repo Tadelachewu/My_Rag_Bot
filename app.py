@@ -1,5 +1,6 @@
 import os
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response
 from fastapi.responses import JSONResponse
 from typing import List
 
@@ -9,15 +10,50 @@ from bot import (
     WORKDIR,
     chunk_text,
     generate_answer_from_passages,
+    build_telegram_application,
+    start_telegram_polling,
+    stop_telegram_polling,
+    logger as bot_logger,
 )
 from pdf_utils import extract_text_from_file
 
-app = FastAPI(title="MyBot Web API")
+_telegram_application = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global _telegram_application
+    enable = os.getenv("ENABLE_TELEGRAM_BOT", "true").strip().lower() in ("1", "true", "yes", "on")
+    token_present = bool((os.getenv("TELEGRAM_TOKEN") or "").strip())
+    if enable and token_present:
+        try:
+            _telegram_application = build_telegram_application()
+            await start_telegram_polling(_telegram_application)
+            bot_logger.info("Telegram polling started")
+        except Exception:
+            bot_logger.exception("Failed to start Telegram polling in web service mode")
+            _telegram_application = None
+    yield
+    if _telegram_application is not None:
+        try:
+            await stop_telegram_polling(_telegram_application)
+            bot_logger.info("Telegram polling stopped")
+        except Exception:
+            bot_logger.exception("Failed to stop Telegram polling cleanly")
+        finally:
+            _telegram_application = None
+
+
+app = FastAPI(title="MyBot Web API", lifespan=lifespan)
 
 
 @app.get("/")
 async def root():
     return {"status": "ok", "mode": os.getenv("MODE", "prod")}
+
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
 
 
 @app.get("/health")
