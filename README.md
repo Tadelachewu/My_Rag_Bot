@@ -83,3 +83,28 @@ If you'd like, I can add a short example of uploading and asking via the Telegra
 	- If you see Chroma sqlite schema/lock errors on startup, stop the service, move or delete `chroma_db/chroma.sqlite3` (or enable Persistent Disk) and redeploy so the service can recreate the DB.
 
 These steps will get the bot running on Render using the repository's current polling implementation. For production, consider running the vector DB and LLM behind managed services or enabling backups for the persistent disk.
+
+**Web Service Mode (Prod) - FastAPI**
+
+- This repo now includes a FastAPI app (`app.py`) and a single entrypoint `run.py` that launches either the Telegram polling bot (dev) or the web service (prod) based on the `MODE` env var.
+- To run as a web service (recommended for Render Web Service):
+
+```
+pip install -r requirements.txt
+MODE=prod python run.py
+```
+
+- On Render set the Start Command to: `python run.py` and set `MODE=prod` in Environment. Render provides `PORT` which `run.py` uses to start Uvicorn.
+- Endpoints provided:
+	- `GET /health` — basic health check
+	- `POST /ask` — JSON `{ "question": "..." }` returns `{"answer": ..., "sources": [...]}`
+	- `POST /upload` — multipart file upload (`file`) accepts `.pdf`, `.pptx`, `.docx` and indexes contents
+
+**Development Mode (Polling)**
+
+- To keep the original polling behavior for local development set `MODE=dev` (or run `python bot.py` directly):
+
+```
+MODE=dev python run.py
+```
+
