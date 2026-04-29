@@ -19,7 +19,7 @@ if MODE == "dev":
 
 else:
     # Production: run FastAPI app with uvicorn. Render will supply PORT env var.
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "10000"))
     host = "0.0.0.0"
     # Import here to avoid adding extra deps when only running dev mode
     try:
