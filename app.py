@@ -15,6 +15,11 @@ from pdf_utils import extract_text_from_file
 app = FastAPI(title="MyBot Web API")
 
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "mode": os.getenv("MODE", "prod")}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "mode": os.getenv("MODE", "prod")}
