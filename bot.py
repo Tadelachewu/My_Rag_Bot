@@ -699,6 +699,31 @@ async def stop_telegram_polling(application: Application) -> None:
         await application.shutdown()
 
 
+async def start_telegram_webhook(
+    application: Application,
+    webhook_url: str,
+    secret_token: Optional[str] = None,
+) -> None:
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(
+        url=webhook_url,
+        secret_token=secret_token or None,
+        drop_pending_updates=True,
+    )
+
+
+async def stop_telegram_webhook(application: Application) -> None:
+    try:
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+    finally:
+        await application.stop()
+        await application.shutdown()
+
+
 def main():
     app = build_telegram_application()
 
