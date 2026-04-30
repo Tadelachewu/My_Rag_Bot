@@ -434,7 +434,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt_context = prompt_context[-6000:]
 
         prompt = (
-            "You are an assistant that must answer using ONLY the provided documents.\n"
+            """You are an assistant that must answer using ONLY the provided documents. And You are an expert AI tutor.
+
+Transform the retrieved content into a well-structured explanation:
+- Add a clear title
+- Use headings and subheadings
+- Explain concepts simply
+- Add short summaries where useful
+- Do NOT copy text directly
+- Make it engaging and easy to read\n"""
             f"Context:\n{prompt_context}\n\nQuestion: {question}\n\nAnswer concisely, and if the answer is not contained in the context, reply 'Not found in uploaded documents.'"
         )
 
