@@ -3,16 +3,18 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, Document, BotCommand
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram import Update, Document, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import chromadb
 # Use the helper constructors exported by chromadb (PersistentClient/EphemeralClient)
 import requests
 from typing import Optional
 import json
 import re
+import html
 from telegram.ext import Application
 from datetime import datetime
+import tempfile
 load_dotenv()
 if os.path.exists(",env"):
     load_dotenv(dotenv_path=",env", override=False)
@@ -299,8 +301,84 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/upload\n"
         "/ask\n"
         "/clear\n"
+        "/public\n"
         "/help"
     )
+
+
+async def public_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Calendar", callback_data="public_calendar")],
+        [InlineKeyboardButton("Other public commands", callback_data="public_other")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Public information commands — choose one:", reply_markup=reply_markup)
+
+
+async def public_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    data = query.data or ""
+    if data == "public_calendar":
+        # Start interactive calendar flow: ask user for country code
+        user_data = context.user_data
+        user_data["calendar_stage"] = "await_country"
+        # Edit the message to prompt next step
+        await query.edit_message_text("Please enter the country code (e.g. ET, US, GB):")
+    elif data == "public_other":
+        await query.edit_message_text("Other public commands — coming soon.")
+    else:
+        await query.edit_message_text("Unknown selection.")
+
+
+async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Start interactive calendar flow: first ask for country code
+    args = context.args if hasattr(context, "args") else []
+    # If user provided inline args, attempt direct fetch; otherwise prompt
+    if args:
+        # try to parse inline args like `/calendar 2026 ET` or `/calendar ET 2026`
+        year = datetime.utcnow().year
+        country = "ET"
+        try:
+            if len(args) == 1:
+                a = args[0]
+                if a.isdigit():
+                    year = int(a)
+                else:
+                    country = a.upper()
+            else:
+                a, b = args[0], args[1]
+                if a.isdigit():
+                    year = int(a)
+                    country = b.upper()
+                elif b.isdigit():
+                    year = int(b)
+                    country = a.upper()
+                else:
+                    country = a.upper()
+
+            api_key = os.getenv("CALENDARIFIC_API_KEY")
+            if not api_key:
+                await update.message.reply_text(
+                    "Calendar API key not configured. Set the CALENDARIFIC_API_KEY environment variable."
+                )
+                return
+
+            holidays = fetch_holidays(year=year, country=country, api_key=api_key)
+            text = format_holidays(holidays, year=year)
+            await send_holiday_output(update, context, text, filename_prefix=f"holidays_{country}_{year}")
+            return
+        except Exception as exc:
+            logger.exception("/calendar direct fetch failed: %s", exc)
+            await update.message.reply_text(f"Failed to fetch calendar: {exc}")
+            return
+
+    # No args — begin interactive prompts
+    user_data = context.user_data
+    user_data["calendar_stage"] = "await_country"
+    await update.message.reply_text("Please enter the country code (e.g. ET, US, GB):")
 
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,6 +449,57 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Indexed {len(chunks)} chunks from {doc.file_name}.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Interactive calendar flow: check if user is in the middle of calendar prompts
+    user_data = context.user_data
+    stage = user_data.get("calendar_stage")
+    if stage:
+        text_in = update.message.text.strip()
+        # If user sent a command while in the flow, abort the calendar flow
+        if text_in.startswith("/"):
+            user_data.pop("calendar_stage", None)
+            user_data.pop("calendar_country", None)
+            await update.message.reply_text("Calendar flow cancelled.")
+            return
+
+        if stage == "await_country":
+            country = text_in.upper()
+            user_data["calendar_country"] = country
+            user_data["calendar_stage"] = "await_year"
+            await update.message.reply_text("Please enter year (e.g. 2026), or 'current' for this year:")
+            return
+
+        if stage == "await_year":
+            country = user_data.get("calendar_country", "ET")
+            year_text = text_in.lower()
+            if year_text in ("current", "now", "this"):
+                year = datetime.utcnow().year
+            else:
+                try:
+                    year = int(re.sub(r"[^0-9]", "", year_text))
+                except Exception:
+                    await update.message.reply_text("Invalid year. Please enter a four-digit year like 2026.")
+                    return
+
+            # clear stage before network call
+            user_data.pop("calendar_stage", None)
+            user_data.pop("calendar_country", None)
+
+            api_key = os.getenv("CALENDARIFIC_API_KEY")
+            if not api_key:
+                await update.message.reply_text(
+                    "Calendar API key not configured. Set the CALENDARIFIC_API_KEY environment variable."
+                )
+                return
+
+            try:
+                holidays = fetch_holidays(year=year, country=country, api_key=api_key)
+                text = format_holidays(holidays, year=year)
+                await send_holiday_output(update, context, text, filename_prefix=f"holidays_{country}_{year}")
+            except Exception as exc:
+                logger.exception("Failed to fetch calendar during interactive flow: %s", exc)
+                await update.message.reply_text(f"Failed to fetch calendar: {exc}")
+            return
+
     question = update.message.text.strip()
     if question.startswith('/'):
         return
@@ -651,6 +780,158 @@ def run_openrouter(prompt: str, model: Optional[str] = None) -> Optional[str]:
         return None
 
 
+def fetch_holidays(year: int = None, country: str = "ET", api_key: Optional[str] = None) -> list:
+    """Fetch holidays from Calendarific API.
+
+    The API key must be provided via the `CALENDARIFIC_API_KEY` environment
+    variable (or passed explicitly). If not set this function raises a
+    `RuntimeError`.
+    """
+    if year is None:
+        year = datetime.utcnow().year
+    env_key = os.getenv("CALENDARIFIC_API_KEY")
+    key = env_key or api_key
+    if not key:
+        raise RuntimeError("CALENDARIFIC_API_KEY environment variable is not set")
+    url = f"https://calendarific.com/api/v2/holidays?year={year}&api_key={key}&country={country}"
+    resp = requests.get(url, timeout=30.0)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response", {}).get("holidays", [])
+
+
+def format_holidays(holidays: list, year: int = None, max_items: int = 20) -> str:
+    """Format holiday entries into a user-friendly text response.
+
+    Truncates long descriptions and limits the number of displayed items.
+    """
+    if year is None:
+        year = datetime.utcnow().year
+    if not holidays:
+        return f"No public holidays found for {year}."
+
+    # Build a monospaced table for readability using HTML <pre> block.
+    # Columns: Date | Name | Description (truncated)
+    lines = []
+    header = f"Public holidays — {year} (showing up to {max_items})"
+    lines.append(header)
+    lines.append("")
+
+    # Column widths
+    w_date = 12
+    w_name = 30
+    w_desc = 60
+
+    def fit(s: str, width: int) -> str:
+        s = html.escape(str(s or ""))
+        if len(s) > width:
+            return s[: max(0, width - 3)] + "..."
+        return s.ljust(width)
+
+    # table header
+    lines.append(f"{ 'Date'.ljust(w_date) }  { 'Name'.ljust(w_name) }  Description")
+    lines.append(f"{ '-'.ljust(w_date, '-') }  { '-'.ljust(w_name, '-') }  {'-' * w_desc }")
+
+    count = 0
+    for h in holidays:
+        if count >= max_items:
+            break
+        name = h.get("name") or "(no name)"
+        date_iso = h.get("date", {}).get("iso") or "(no date)"
+        desc = h.get("description") or ""
+        desc = re.sub(r"\s+", " ", desc).strip()
+
+        line = f"{fit(date_iso, w_date)}  {fit(name, w_name)}  {fit(desc, w_desc)}"
+        lines.append(line)
+        count += 1
+
+    more = len(holidays) - count
+    if more > 0:
+        lines.append("")
+        lines.append(f"And {more} more holidays not shown.")
+
+    # Wrap in <pre> to preserve spacing. Escape HTML and replace spaces
+    # with non-breaking spaces so clients avoid wrapping and allow horizontal scrolling.
+    body = "\n".join(lines)
+    body_escaped = html.escape(body).replace(" ", "&nbsp;")
+    return f"<pre>{body_escaped}</pre>"
+
+
+async def send_holiday_output(update: Update, context: ContextTypes.DEFAULT_TYPE, html_text: str, filename_prefix: str = "holidays"):
+    """Deliver holiday output to the user. If the content is large, send as a .txt document to allow vertical scrolling.
+
+    Accepts `html_text` produced by `format_holidays` (an HTML <pre> block). For large outputs
+    we unwrap and send a plain `.txt` file; otherwise send as an HTML reply.
+    """
+    # Determine plain text by unescaping and removing <pre> tags
+    plain = html.unescape(html_text)
+    # remove surrounding <pre> if present
+    if plain.startswith("<pre>") and plain.endswith("</pre>"):
+        plain_body = plain[5:-6]
+    else:
+        plain_body = plain
+    # Replace non-breaking spaces with regular spaces for the text file
+    plain_body = plain_body.replace("&nbsp;", " ")
+
+    # Heuristic: if too long, send as a file so client can scroll freely
+    too_long = len(plain_body) > 3500 or plain_body.count("\n") > 80 or len(html_text) > 3500
+    if too_long:
+        fd, path = tempfile.mkstemp(prefix=filename_prefix + "-", suffix=".txt", dir=str(WORKDIR))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(plain_body)
+
+            chat_id = None
+            if update.callback_query is not None:
+                chat_id = update.callback_query.message.chat_id
+            elif update.message is not None:
+                chat_id = update.message.chat_id
+            else:
+                # fallback to bot owner not known
+                chat_id = None
+
+            if chat_id is None:
+                # fallback to sending reply normally
+                await update.message.reply_text("(Unable to send file; showing inline.)")
+                try:
+                    await update.message.reply_text(html_text, parse_mode="HTML")
+                except Exception:
+                    # give up
+                    pass
+                return
+
+            # send file
+            with open(path, "rb") as doc:
+                await context.bot.send_document(chat_id=chat_id, document=doc, filename=f"{filename_prefix}.txt")
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    else:
+        # send inline as HTML (preformatted)
+        try:
+            if update.callback_query is not None:
+                # edit the callback message
+                await update.callback_query.edit_message_text(html_text, parse_mode="HTML")
+            else:
+                await update.message.reply_text(html_text, parse_mode="HTML")
+        except Exception as exc:
+            # fallback to file if Telegram rejects the message (too long)
+            try:
+                fd, path = tempfile.mkstemp(prefix=filename_prefix + "-", suffix=".txt", dir=str(WORKDIR))
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(plain_body)
+                with open(path, "rb") as doc:
+                    chat_id = update.callback_query.message.chat_id if update.callback_query is not None else update.message.chat_id
+                    await context.bot.send_document(chat_id=chat_id, document=doc, filename=f"{filename_prefix}.txt")
+            finally:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+
 def choose_llm(prompt: str) -> Optional[str]:
     """Prefer OpenRouter if configured, else fall back to Ollama local HTTP API."""
     if OPENROUTER_API_KEY:
@@ -666,6 +947,8 @@ async def _post_init(application: Application):
             BotCommand("upload", "Upload a PDF"),
             BotCommand("ask", "Ask a question"),
             BotCommand("clear", "Clear all uploaded files and reset DB"),
+            BotCommand("public", "Public info (coming soon)"),
+            BotCommand("calendar", "Public calendar (coming soon)"),
             BotCommand("help", "Help"),
         ]
         await application.bot.set_my_commands(cmds)
@@ -683,6 +966,9 @@ def build_telegram_application(token: Optional[str] = None) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("upload", upload_cmd))
     application.add_handler(CommandHandler("ask", ask_cmd))
+    application.add_handler(CommandHandler("public", public_cmd))
+    application.add_handler(CommandHandler("calendar", calendar_cmd))
+    application.add_handler(CallbackQueryHandler(public_callback, pattern=r"^public_"))
     application.add_handler(CommandHandler("clear", clear_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
